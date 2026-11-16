@@ -149,7 +149,7 @@ const DISTRICTS = [
 // ════════════════════════════════════════════════
 const ENDPOINTS = {
   apt:  'http://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev',
-  rh:   rh:   'http://apis.data.go.kr/1613000/RTMSDataSvcRHTrade2/getRTMSDataSvcRHTrade2',
+  rh:   'http://apis.data.go.kr/1613000/RTMSDataSvcRHTrade2/getRTMSDataSvcRHTrade2',
   sh:   'http://apis.data.go.kr/1613000/RTMSDataSvcSHTrade/getRTMSDataSvcSHTrade',
   offi: 'http://apis.data.go.kr/1613000/RTMSDataSvcOffiTrade/getRTMSDataSvcOffiTrade', // 오피스텔 — 제외하려면 이 줄 주석 처리
 };
