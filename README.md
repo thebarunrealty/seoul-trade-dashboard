@@ -18,7 +18,7 @@ GitHub Actions 가 모으고 GitHub Pages 가 보여 준다. 맥이나 PC 는 �
 | `ingest-rebuild.yml` | 매월 2일 05:00 | 정비사업 |
 | `freshness.yml` | 매일 09:00 | 데이터가 오래됐는지 감시(실패하면 알림) |
 | `pages.yml` | main 에 올릴 때 | 사이트 발행 |
-| `verify.yml` | PR | 리포트 검증(2026-10-29부터 「workflow file issue」로 실패 중, 원인 미확인) |
+| `verify.yml` | 사람이 연 PR·수동 실행 | 화면 품질 게이트(puppeteer, `npm run verify`). 리포트 검증이 아니다. 봇이 연 데이터 PR 에서는 실행 승인 대기가 만료돼 돌지 않으므로(실행 #43), `ingest.yml`·`ingest-price.yml` 이 병합 전에 같은 잡에서 직접 검사하고 실패하면 경고만 남기고 병합한다 |
 
 ## 키 (GitHub 저장소 Settings → Secrets and variables → Actions)
 
