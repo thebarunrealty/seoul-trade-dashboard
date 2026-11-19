@@ -56,8 +56,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # puppeteer 25.3.0 이 node >=22.12.0 을 요구한다(package-lock.json) — 그 아래로 내려가지 않게 고정.
-          node-version: '22.12'
+          # '22' 는 22.x 최신을 받는다. puppeteer 25.3.0 이 요구하는 node >=22.12.0(package-lock.json)을
+          # 이미 만족하므로 '22.12' 로 묶지 않는다('22.12' 는 22.12.x 에 고정돼 보안 업데이트를 놓친다).
+          node-version: '22'
       # ingest.mjs 는 의존성이 없다(내장 fetch 만 쓴다). 수집에는 npm ci 가 필요 없다.
       # npm ci 는 아래 품질 게이트 단계에서만 한다(화면·데이터가 바뀐 회차에만).
 
