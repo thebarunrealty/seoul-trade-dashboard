@@ -18,7 +18,7 @@ GitHub Actions 가 모으고 GitHub Pages 가 보여 준다. 맥이나 PC 는 �
 | `ingest-rebuild.yml` | 매월 2일 05:00 | 정비사업 |
 | `freshness.yml` | 매일 09:00 | 데이터가 오래됐는지 감시(실패하면 알림) |
 | `pages.yml` | main 에 올릴 때 | 사이트 발행 |
-| `verify.yml` | 지정 경로(`dashboard.html`·`data.js` 등)가 바뀐 PR·수동 실행 | 화면 품질 게이트(puppeteer, `npm run verify`). 리포트 검증이 아니다. 봇이 연 데이터 PR 에서는 실행 승인 대기가 만료돼 돌지 않으므로(실행 #43), `ingest.yml`·`ingest-price.yml` 이 병합 전에 같은 잡에서 직접 검사한다. 이 자체 검사는 `dashboard.html` 또는 `data.js` 가 바뀐 회차에만 돌고, 실패(준비 실패 포함)해도 경고만 남기며 병합을 막지 않는다 |
+| `verify.yml` | 지정 경로(`dashboard.html`·`data.js` 등)가 바뀐 PR·수동 실행 | 화면 품질 게이트(puppeteer, `npm run verify`). 리포트 검증이 아니다. 봇이 연 데이터 PR 에서는 실행 승인 대기가 만료돼 돌지 않으므로(실행 #43), `ingest.yml`·`ingest-price.yml` 이 병합 전에 읽기 권한만 가진 별도 검사 잡에서 검사한다. 이 자체 검사는 `dashboard.html` 또는 `data.js` 가 바뀐 회차에만 돌고, 실패(준비 실패 포함)해도 경고만 남기며 병합을 막지 않는다 |
 
 ## 키 (GitHub 저장소 Settings → Secrets and variables → Actions)
 
