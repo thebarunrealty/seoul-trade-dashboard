@@ -68,7 +68,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          # puppeteer 25.3.0 이 node >=22.12.0 을 요구한다(package-lock.json) — 그 아래로 내려가지 않게 고정.
+          node-version: '22.12'
       # ingest-price.mjs 는 의존성이 없다(내장 fetch 만 쓴다). 수집에는 npm ci 가 필요 없다.
       # npm ci 는 아래 품질 게이트 단계에서만 한다(화면·데이터가 바뀐 회차에만).
 
@@ -133,28 +134,34 @@ jobs:
       # verify.yml 은 이 워크플로가 GITHUB_TOKEN 으로 연 PR 에서는 실행 승인 대기가
       # 만료돼 돌지 않는다(실행 #43, PR #88). 그래서 병합 전에 여기서 직접 돌린다.
       # 단계 구성은 verify.yml 과 같다. 실패해도 병합은 막지 않는다 — 경고만 남긴다.
-      # 준비 단계(npm ci·크롬 확인)도 실패를 허용한다. 크롬 다운로드 같은 일시적
+      # 준비 단계(npm ci·AppArmor·크롬 확인)도 실패를 허용한다. 크롬 다운로드 같은 일시적
       # 실패로 데이터 병합이 멈추지 않게 하기 위해서다. 준비가 실패하면 검사는
       # 건너뛰고 "준비 실패" 경고를 남긴다.
 
       # puppeteer 가 postinstall 에서 Chrome for Testing 을 내려받는다.
       # 러너에 크롬이 기본 설치돼 있지 않으므로 이 단계가 곧 크롬 설치다.
+      # 다운로드가 걸려도 잡 전체(병합 포함)를 붙잡지 않게 단계 제한 시간을 둔다.
       - name: 의존성 설치 (puppeteer + Chrome)
         id: npm_ci
         if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true'
         continue-on-error: true
+        timeout-minutes: 8
         run: npm ci
 
       # Ubuntu 23.10+ 는 AppArmor 로 비특권 user namespace 를 막아 크롬 샌드박스가 뜨지 않는다.
       # 제품 코드에 --no-sandbox 를 넣는 대신 러너 쪽 제한을 푼다(verify.yml 과 같은 처리).
+      # 실패하면 샌드박스가 뜨지 않으므로 검사를 건너뛰고 준비 실패로 경고한다.
       - name: 크롬 샌드박스 허용 (AppArmor 제한 해제)
+        id: apparmor
         if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true'
+        continue-on-error: true
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       # puppeteer 25 의 executablePath() 는 Promise 를 반환한다 — await 해야 경로가 나온다.
+      # npm ci 가 실패했으면 puppeteer 가 없어 같은 원인으로 또 실패하므로 건너뛴다.
       - name: 크롬 실제 존재 확인
         id: chrome
-        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true'
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true' && steps.npm_ci.outcome == 'success'
         continue-on-error: true
         run: |
           node -e "
@@ -169,31 +176,40 @@ jobs:
           "
 
       # continue-on-error 단계는 실패해도 conclusion 이 success 라서 outcome 으로 본다.
+      # 준비 세 단계가 모두 성공했을 때만 돈다.
       - name: 품질 게이트 실행
         id: quality
-        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true' && steps.npm_ci.outcome == 'success' && steps.chrome.outcome == 'success'
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true' && steps.npm_ci.outcome == 'success' && steps.apparmor.outcome == 'success' && steps.chrome.outcome == 'success'
         continue-on-error: true
+        timeout-minutes: 5
         run: npm run verify
 
+      # 검사 대상 회차인데 검사가 건너뛰어졌다 = 준비 단계 중 하나가 성공하지 못했다.
+      # 경고 단계는 PR·병합보다 먼저 돈다 — 그래서 문구는 "막지 않는다" 로 쓴다.
       - name: 품질 게이트 준비 실패 경고
-        if: steps.npm_ci.outcome == 'failure' || steps.chrome.outcome == 'failure'
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true' && steps.quality.outcome == 'skipped'
         run: |
           FAILED=""
-          [ "${{ steps.npm_ci.outcome }}" = "failure" ] && FAILED="의존성 설치 (puppeteer + Chrome)"
-          [ "${{ steps.chrome.outcome }}" = "failure" ] && FAILED="${FAILED:+$FAILED, }크롬 실제 존재 확인"
-          echo "::warning title=품질 게이트 준비 실패::'$FAILED' 단계가 실패해 npm run verify 를 실행하지 못했다 — 병합은 그대로 진행한다"
+          for pair in "의존성 설치 (puppeteer + Chrome)=${{ steps.npm_ci.outcome }}" \
+                      "크롬 샌드박스 허용 (AppArmor 제한 해제)=${{ steps.apparmor.outcome }}" \
+                      "크롬 실제 존재 확인=${{ steps.chrome.outcome }}"; do
+            case "${pair##*=}" in
+              failure|cancelled) FAILED="${FAILED:+$FAILED, }${pair%=*}(${pair##*=})" ;;
+            esac
+          done
+          echo "::warning title=품질 게이트 준비 실패::'$FAILED' 단계가 실패해 npm run verify 를 실행하지 못했다 — 병합은 막지 않는다(경고만)"
           {
             echo "### ⚠️ 품질 게이트를 실행하지 못함"
-            echo "- 실패한 준비 단계: $FAILED — 경고만 남기고 병합을 진행했다"
+            echo "- 실패한 준비 단계: $FAILED — 병합은 막지 않는다(경고만)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 품질 게이트 실패 경고
-        if: steps.quality.outcome == 'failure'
+        if: steps.quality.outcome == 'failure' || steps.quality.outcome == 'cancelled'
         run: |
-          echo "::warning title=품질 게이트 실패::npm run verify 실패 — 병합은 그대로 진행한다. '품질 게이트 실행' 단계 로그를 확인하라"
+          echo "::warning title=품질 게이트 실패::npm run verify 실패(${{ steps.quality.outcome }}) — 병합은 막지 않는다(경고만). '품질 게이트 실행' 단계 로그를 확인하라"
           {
             echo "### ⚠️ 품질 게이트 실패"
-            echo "- npm run verify 실패 — 경고만 남기고 병합을 진행했다. '품질 게이트 실행' 단계 로그 확인"
+            echo "- npm run verify 실패(${{ steps.quality.outcome }}) — 병합은 막지 않는다(경고만). '품질 게이트 실행' 단계 로그 확인"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # main 은 ruleset 보호라 PR 로 들어간다 — 다른 수집 워크플로와 같은 경로.
@@ -243,11 +259,14 @@ jobs:
       - name: 결과 요약
         if: always()
         run: |
-          case "${{ steps.quality.outcome }}/${{ steps.npm_ci.outcome }}/${{ steps.chrome.outcome }}" in
-            success/*) V="통과" ;;
-            failure/*) V="실패(경고만, 병합 진행)" ;;
-            */failure/*|*/failure) V="준비 실패로 미실행(경고만, 병합 진행)" ;;
-            *) V="건너뜀" ;;
+          PREP=" ${{ steps.npm_ci.outcome }} ${{ steps.apparmor.outcome }} ${{ steps.chrome.outcome }} "
+          case "${{ steps.quality.outcome }}" in
+            success) V="통과" ;;
+            failure|cancelled) V="실패(경고만, 병합은 막지 않음)" ;;
+            *) case "$PREP" in
+                 *" failure "*|*" cancelled "*) V="준비 실패로 미실행(경고만, 병합은 막지 않음)" ;;
+                 *) V="건너뜀" ;;
+               esac ;;
           esac
           {
             echo "### 가격 수집"
