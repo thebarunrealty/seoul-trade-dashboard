@@ -62,14 +62,15 @@ concurrency:
 jobs:
   price:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      # ingest-price.mjs 는 의존성이 없다(내장 fetch 만 쓴다). npm ci 를 하지 않는다.
+      # ingest-price.mjs 는 의존성이 없다(내장 fetch 만 쓴다). 수집에는 npm ci 가 필요 없다.
+      # npm ci 는 아래 품질 게이트 단계에서만 한다(화면·데이터가 바뀐 회차에만).
 
       - name: 수집 실행
         id: collect
@@ -102,7 +103,8 @@ jobs:
       - name: 화면 반영 (⑥ 가격만)
         run: |
           set -euo pipefail
-          # ingest.mjs 는 의존성이 없다 — npm ci 없이 npm run 만으로 돈다.
+          # ingest.mjs 는 의존성이 없다 — 이 단계는 npm ci 전에 npm run 만으로 돈다.
+          # npm ci 는 아래 품질 게이트 단계에서만 한다.
           npm run price-only | tee /tmp/price-inject.log
 
       # 캐시와 화면을 **한 번에** 본다. 캐시만 보면 "캐시는 그대로인데 화면이 밀려
@@ -119,6 +121,80 @@ jobs:
             echo "파일 $(git diff --cached --name-only | wc -l | tr -d ' ')개 변경"
             git diff --cached --name-only | sed 's/^/  /'
           fi
+          # 위 git add 로 스테이징한 뒤에 판정한다. 캐시만 바뀌고 화면·데이터가
+          # 그대로인 회차는 품질 게이트를 건너뛴다.
+          if git diff --cached --quiet -- dashboard/dashboard.html dashboard/data.js; then
+            echo "needs_verify=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_verify=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 품질 게이트 (병합 전, 같은 잡에서) ─────────────────
+      # verify.yml 은 이 워크플로가 GITHUB_TOKEN 으로 연 PR 에서는 실행 승인 대기가
+      # 만료돼 돌지 않는다(실행 #43, PR #88). 그래서 병합 전에 여기서 직접 돌린다.
+      # 단계 구성은 verify.yml 과 같다. 실패해도 병합은 막지 않는다 — 경고만 남긴다.
+      # 준비 단계(npm ci·크롬 확인)도 실패를 허용한다. 크롬 다운로드 같은 일시적
+      # 실패로 데이터 병합이 멈추지 않게 하기 위해서다. 준비가 실패하면 검사는
+      # 건너뛰고 "준비 실패" 경고를 남긴다.
+
+      # puppeteer 가 postinstall 에서 Chrome for Testing 을 내려받는다.
+      # 러너에 크롬이 기본 설치돼 있지 않으므로 이 단계가 곧 크롬 설치다.
+      - name: 의존성 설치 (puppeteer + Chrome)
+        id: npm_ci
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true'
+        continue-on-error: true
+        run: npm ci
+
+      # Ubuntu 23.10+ 는 AppArmor 로 비특권 user namespace 를 막아 크롬 샌드박스가 뜨지 않는다.
+      # 제품 코드에 --no-sandbox 를 넣는 대신 러너 쪽 제한을 푼다(verify.yml 과 같은 처리).
+      - name: 크롬 샌드박스 허용 (AppArmor 제한 해제)
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # puppeteer 25 의 executablePath() 는 Promise 를 반환한다 — await 해야 경로가 나온다.
+      - name: 크롬 실제 존재 확인
+        id: chrome
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true'
+        continue-on-error: true
+        run: |
+          node -e "
+          const p = require('puppeteer');
+          const fs = require('node:fs');
+          (async () => {
+            const ep = await p.executablePath();
+            console.log('executablePath:', ep);
+            fs.accessSync(ep, fs.constants.X_OK);
+            console.log('실행 가능 확인 완료');
+          })().catch(e => { console.error('크롬 실행파일 확인 실패:', e.message); process.exit(1); });
+          "
+
+      # continue-on-error 단계는 실패해도 conclusion 이 success 라서 outcome 으로 본다.
+      - name: 품질 게이트 실행
+        id: quality
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.needs_verify == 'true' && steps.npm_ci.outcome == 'success' && steps.chrome.outcome == 'success'
+        continue-on-error: true
+        run: npm run verify
+
+      - name: 품질 게이트 준비 실패 경고
+        if: steps.npm_ci.outcome == 'failure' || steps.chrome.outcome == 'failure'
+        run: |
+          FAILED=""
+          [ "${{ steps.npm_ci.outcome }}" = "failure" ] && FAILED="의존성 설치 (puppeteer + Chrome)"
+          [ "${{ steps.chrome.outcome }}" = "failure" ] && FAILED="${FAILED:+$FAILED, }크롬 실제 존재 확인"
+          echo "::warning title=품질 게이트 준비 실패::'$FAILED' 단계가 실패해 npm run verify 를 실행하지 못했다 — 병합은 그대로 진행한다"
+          {
+            echo "### ⚠️ 품질 게이트를 실행하지 못함"
+            echo "- 실패한 준비 단계: $FAILED — 경고만 남기고 병합을 진행했다"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 품질 게이트 실패 경고
+        if: steps.quality.outcome == 'failure'
+        run: |
+          echo "::warning title=품질 게이트 실패::npm run verify 실패 — 병합은 그대로 진행한다. '품질 게이트 실행' 단계 로그를 확인하라"
+          {
+            echo "### ⚠️ 품질 게이트 실패"
+            echo "- npm run verify 실패 — 경고만 남기고 병합을 진행했다. '품질 게이트 실행' 단계 로그 확인"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # main 은 ruleset 보호라 PR 로 들어간다 — 다른 수집 워크플로와 같은 경로.
       # 캐시와 data.js 를 **한 PR 로** 넣는다. 둘을 나누면 캐시만 병합된 채
@@ -167,6 +243,12 @@ jobs:
       - name: 결과 요약
         if: always()
         run: |
+          case "${{ steps.quality.outcome }}/${{ steps.npm_ci.outcome }}/${{ steps.chrome.outcome }}" in
+            success/*) V="통과" ;;
+            failure/*) V="실패(경고만, 병합 진행)" ;;
+            */failure/*|*/failure) V="준비 실패로 미실행(경고만, 병합 진행)" ;;
+            *) V="건너뜀" ;;
+          esac
           {
             echo "### 가격 수집"
             echo ""
@@ -175,4 +257,5 @@ jobs:
             echo ""
             echo "- 캐시 변경: **${{ steps.diff.outputs.changed || 'false' }}**"
             echo "- 바뀌는 그림: **06 (가격) 하나** — 01~05 와 거래량 숫자는 그대로"
+            echo "- 품질 게이트: **$V**"
           } >> "$GITHUB_STEP_SUMMARY"
