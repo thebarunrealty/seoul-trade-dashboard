@@ -112,9 +112,10 @@ jobs:
       - name: 화면 반영 (⑥ 가격만)
         run: |
           set -euo pipefail
-          # ingest.mjs 는 의존성이 없다 — node_modules 없이 npm run 만으로 돈다
-          # (package.json 의 스크립트만 실행한다). npm ci 는 verify 잡에서만 한다.
-          npm run price-only | tee /tmp/price-inject.log
+          # npm run price-only 와 같은 명령이다. 쓰기 토큰·시크릿이 있는 이 잡에서
+          # npm 의 전후 훅(pre/post 스크립트)이 돌 여지를 두지 않으려고 node 로 직접 부른다.
+          # npm ci·검사는 verify 잡에서만 한다.
+          node dashboard/ingest.mjs --price-only | tee /tmp/price-inject.log
 
       # 캐시와 화면을 **한 번에** 본다. 캐시만 보면 "캐시는 그대로인데 화면이 밀려
       # 있던" 회차를 놓친다(위 자기 치유의 반쪽). data.json 은 gitignored 다.
@@ -155,6 +156,8 @@ jobs:
             process.stdout.write(JSON.parse(fs.readFileSync(dir+'/'+f,'utf8')).asOf);
           ")
           [ -n "$ASOF" ] || { echo "::error::캐시에서 기준일을 읽지 못했다"; exit 1; }
+          # 출력·커밋 메시지·PR 제목에 들어가는 값이다. 한 줄 YYYY-MM-DD 가 아니면 멈춘다.
+          [[ "$ASOF" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::기준일 형식이 YYYY-MM-DD 가 아니다"; exit 1; }
           BRANCH="price/$(date -u +%Y%m%d-%H%M%S)"
 
           git config user.name  'github-actions[bot]'
@@ -163,11 +166,18 @@ jobs:
           git commit -m "data: 가격 수집 ${ASOF} 기준" \
                      -m "한국부동산원 주간 아파트 매매가격지수. GitHub Actions 자동 수집 (실행 ${{ github.run_id }}). 캐시 + ⑥ 가격만 반영한 data.js. 거래량과 generatedAt 은 건드리지 않았다."
           git push origin "$BRANCH"
+          SHA=$(git rev-parse HEAD)
           {
             echo "branch=$BRANCH"
-            echo "sha=$(git rev-parse HEAD)"
+            echo "sha=$SHA"
             echo "asof=$ASOF"
           } >> "$GITHUB_OUTPUT"
+          # merge 잡이 실패해도 무엇이 push 됐는지 이 실행 요약에서 찾을 수 있게 남긴다.
+          {
+            echo "### 수집 브랜치"
+            echo "- 브랜치: \`$BRANCH\`"
+            echo "- 커밋: \`$SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # 가격 로그(/tmp/*.log)는 이 VM 에만 있으므로 수집 요약은 이 잡에서 쓴다.
       # 품질 게이트 결과 줄은 merge 잡의 요약에 나온다.
@@ -322,41 +332,90 @@ jobs:
       SHA: ${{ needs.price.outputs.sha }}
       ASOF: ${{ needs.price.outputs.asof }}
     steps:
+      # 수집 잡 출력은 아래에서 git ref·API 경로·PR 제목에 그대로 쓰인다.
+      # 수집 잡이 만드는 형식과 정확히 같지 않으면 아무것도 하지 않고 멈춘다.
+      - name: 수집 잡 출력 검사
+        run: |
+          set -euo pipefail
+          ok=true
+          [[ "$BRANCH" =~ ^price/[0-9]{8}-[0-9]{6}$ ]] || { echo "::error::branch 가 price/YYYYMMDD-HHMMSS 형식이 아니다"; ok=false; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha 가 40자 16진수가 아니다"; ok=false; }
+          [[ "$ASOF" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::asof 가 YYYY-MM-DD 형식이 아니다"; ok=false; }
+          $ok
+
       # 아래 gh pr merge --match-head-commit 지원 여부를 로그로 남긴다.
       - name: gh 버전
         run: gh --version
 
-      - name: PR 로 반영
+      # 재실행 대비 — 같은 head 브랜치로 열린 PR 이 이미 있으면 새로 만들지 않고 그 PR 을 쓴다.
+      - name: PR 생성
+        id: pr
         run: |
           set -euo pipefail
-          [ -n "$BRANCH" ] && [ -n "$SHA" ] && [ -n "$ASOF" ] \
-            || { echo "::error::수집 잡 출력(branch·sha·asof)이 비어 있다"; exit 1; }
-
-          gh pr create --base main --head "$BRANCH" \
-            --title "data: 가격 수집 ${ASOF} 기준" \
-            --body "$(printf '%s\n' \
+          PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$PR" ]; then
+            echo "열린 PR #$PR 이 이미 있다 — 그 PR 을 쓴다"
+          else
+            URL=$(gh pr create --base main --head "$BRANCH" \
+              --title "data: 가격 수집 ${ASOF} 기준" \
+              --body "$(printf '%s\n' \
               '한국부동산원 주간 아파트 매매가격지수 캐시를 갱신하고, ⑥ 가격만 `data.js` 에 다시 넣었다. 요구 승인이 0건이라 승인 없이 병합된다.' \
               '' \
               '거래량(①②③·추이)과 `generatedAt` 은 그대로다 — RTMS 를 부르지 않았다.' \
               '' \
               '병합 뒤 `report.yml` 을 불러 06번 그림을 다시 그리고 발행까지 이어 간다.' \
               '' \
-              "실행: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")"
+              "실행: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")")
+            echo "$URL"
+            PR="${URL##*/}"
+          fi
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "::error::PR 번호를 얻지 못했다"; exit 1; }
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
 
-          # 수집 잡이 push 하고 verify 잡이 검사한 그 커밋일 때만 병합한다.
-          gh pr merge "$BRANCH" --squash --delete-branch --match-head-commit "$SHA"
+      # squash 로 합쳐 main 이력에 수집 커밋 하나만 남긴다.
+      # 수집 잡이 push 하고 verify 잡이 검사한 그 커밋일 때만 병합한다.
+      # 브랜치 삭제는 다음 단계가 따로 한다(실패해도 리포트 호출을 막지 않게).
+      - name: 병합
+        id: merge
+        env:
+          PR: ${{ steps.pr.outputs.number }}
+        run: gh pr merge "$PR" --squash --match-head-commit "$SHA"
 
-          # GITHUB_TOKEN 의 병합은 push 트리거를 발동시키지 않으므로 직접 부른다
-          # (ingest.yml 과 같은 경로). report.yml 이 검증·렌더·커밋을 하고 발행까지
-          # 이어 간다 — verify-report 가 실패하면 그림도 발행도 나가지 않는다.
+      # 예전 gh pr merge --delete-branch 와 같은 효과(병합된 원격 head 브랜치 삭제)다.
+      # 체크아웃이 없는 잡이라 gh 의 로컬 브랜치 정리에 기대지 않고 API 로 지운다.
+      # 실패해도 병합은 끝난 뒤다 — 경고만 남긴다.
+      - name: 브랜치 정리
+        id: delete_branch
+        if: steps.merge.outcome == 'success'
+        continue-on-error: true
+        run: |
+          if ! gh api -X DELETE "repos/$GH_REPO/git/refs/heads/$BRANCH"; then
+            echo "::warning title=브랜치 정리 실패::병합은 끝났다. 브랜치 $BRANCH 를 손으로 지워도 된다"
+            exit 1
+          fi
+
+      # GITHUB_TOKEN 의 병합은 push 트리거를 발동시키지 않으므로 직접 부른다
+      # (ingest.yml 과 같은 경로). report.yml 이 검증·렌더·커밋을 하고 발행까지
+      # 이어 간다 — verify-report 가 실패하면 그림도 발행도 나가지 않는다.
+      # 브랜치 정리가 실패해도 부른다 — 병합이 됐으면 06 갱신·발행까지 가야 한다.
+      - name: 리포트 요청
+        id: report
+        if: always() && steps.merge.outcome == 'success'
+        run: |
           gh workflow run report.yml --ref main
           echo "리포트 생성(report.yml) 요청 완료 — 06번만 바뀐다"
 
-      # 품질 게이트 결과 한 줄. verify 잡이 건너뛰어졌거나(캐시만 바뀐 회차) 판정 전에
-      # 끝났으면(체크아웃 실패·잡 시간 초과) 잡 결과로 판정한다.
-      - name: 결과 (품질 게이트)
+      # 발행만 따로 복구할 수 있게 PR·병합·리포트 요청 여부를 요약에 남긴다.
+      # 품질 게이트 줄: verify 가 건너뛰어진 것은 화면·데이터가 안 바뀐 회차(needs_verify=false)
+      # 뿐이어야 정상이다. 판정이 비어 있는 그 밖의 모든 경우는 판정 누락으로 경고한다.
+      - name: 결과 (병합·품질 게이트)
         if: always()
         env:
+          PR: ${{ steps.pr.outputs.number }}
+          MERGE: ${{ steps.merge.outcome }}
+          DELETE_BRANCH: ${{ steps.delete_branch.outcome }}
+          REPORT: ${{ steps.report.outcome }}
+          NEEDS_VERIFY: ${{ needs.price.outputs.needs_verify }}
           VERIFY_RESULT: ${{ needs.verify.result }}
           VERDICT: ${{ needs.verify.outputs.verdict }}
         run: |
@@ -364,10 +423,33 @@ jobs:
             통과) V="통과" ;;
             실패) V="실패(경고만, 병합은 막지 않음)" ;;
             준비실패) V="준비 실패로 미실행(경고만, 병합은 막지 않음)" ;;
-            *) case "$VERIFY_RESULT" in
-                 failure|cancelled) V="준비 실패 또는 시간 초과로 미실행(경고만, 병합은 막지 않음)" ;;
-                 *) V="건너뜀" ;;
-               esac ;;
+            *) if [ "$VERIFY_RESULT" = "skipped" ] && [ "$NEEDS_VERIFY" = "false" ]; then
+                 V="건너뜀(화면·데이터 변경 없음)"
+               else
+                 V="검사 중단 또는 판정 누락(verify 잡 결과: ${VERIFY_RESULT:-없음}) — 경고만, 병합은 막지 않음"
+                 echo "::warning title=품질 게이트 판정 누락::$V"
+               fi ;;
           esac
+          if [ -n "$PR" ]; then PR_LINE="#$PR"; else PR_LINE="만들지 못함"; fi
+          if [ "$MERGE" = "success" ]; then MERGE_LINE="됨"; else MERGE_LINE="안 됨(${MERGE:-실행 안 함})"; fi
+          case "$DELETE_BRANCH" in
+            success) DEL_LINE="됨" ;;
+            failure) DEL_LINE="실패 — 브랜치 $BRANCH 를 손으로 지워도 된다" ;;
+            *) DEL_LINE="안 함" ;;
+          esac
+          if [ "$REPORT" = "success" ]; then
+            REPORT_LINE="됨"
+          elif [ "$MERGE" = "success" ]; then
+            REPORT_LINE="안 됨 — 발행만 복구하려면 gh workflow run report.yml --ref main"
+          else
+            REPORT_LINE="안 함(병합 안 됨)"
+          fi
           echo "품질 게이트: $V"
-          echo "- 품질 게이트: **$V**" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### 병합"
+            echo "- PR: $PR_LINE"
+            echo "- 병합: $MERGE_LINE"
+            echo "- 브랜치 정리: $DEL_LINE"
+            echo "- 리포트 요청(report.yml): $REPORT_LINE"
+            echo "- 품질 게이트: $V"
+          } >> "$GITHUB_STEP_SUMMARY"
