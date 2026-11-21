@@ -353,7 +353,7 @@ jobs:
         run: |
           set -euo pipefail
           # main 을 향하고 같은 저장소 브랜치에서 온 열린 PR 만 재사용한다(다른 base·fork PR 은 제외).
-          PR=$(gh pr list --head "$BRANCH" --base main --state open --json number,isCrossRepository                  --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')
+          PR=$(gh pr list --head "$BRANCH" --base main --state open --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')
           if [ -n "$PR" ]; then
             echo "열린 PR #$PR 이 이미 있다 — 그 PR 을 쓴다"
           else
