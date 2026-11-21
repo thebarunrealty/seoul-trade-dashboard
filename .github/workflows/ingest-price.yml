@@ -47,12 +47,10 @@ on:
         default: false
         type: boolean
 
-permissions:
-  contents: write
-  pull-requests: write
-  # 마지막의 `gh workflow run report.yml` 이 이 권한을 쓴다. 없으면 호출이
-  # HTTP 403 (Resource not accessible by integration) 으로 죽는다 — ingest.yml 과 같은 이유.
-  actions: write
+# 권한은 잡마다 따로 준다. 의존성 코드(npm ci·puppeteer)를 쓰기 토큰이나 시크릿이 있는
+# VM 에서 돌리지 않기 위해 수집(contents: write)·검사(read)·병합(PR·actions write)
+# 잡 3개로 나눴다. 워크플로 단위 기본 권한은 비워 둔다.
+permissions: {}
 
 # 같은 주에 여러 번 도는 워크플로다. 겹쳐 돌면 캐시 파일을 두 실행이 다툰다.
 concurrency:
@@ -60,16 +58,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ── 1. 수집 잡: 시크릿과 contents: write. npm 의존성은 설치하지 않는다 ──
   price:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+      needs_verify: ${{ steps.diff.outputs.needs_verify }}
+      branch: ${{ steps.push.outputs.branch }}
+      sha: ${{ steps.push.outputs.sha }}
+      asof: ${{ steps.push.outputs.asof }}
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v4
         with:
+          # '22' 는 22.x 최신을 받는다. puppeteer 25.3.0 이 요구하는 node >=22.12.0(package-lock.json)을
+          # 이미 만족하므로 '22.12' 로 묶지 않는다('22.12' 는 22.12.x 에 고정돼 보안 업데이트를 놓친다).
           node-version: '22'
-      # ingest-price.mjs 는 의존성이 없다(내장 fetch 만 쓴다). npm ci 를 하지 않는다.
+      # ingest-price.mjs 는 의존성이 없다(내장 fetch 만 쓴다). 이 잡은 npm ci 를 하지 않는다.
+      # npm ci·검사는 읽기 권한만 가진 verify 잡에서 한다(화면·데이터가 바뀐 회차에만).
 
       - name: 수집 실행
         id: collect
@@ -102,8 +112,10 @@ jobs:
       - name: 화면 반영 (⑥ 가격만)
         run: |
           set -euo pipefail
-          # ingest.mjs 는 의존성이 없다 — npm ci 없이 npm run 만으로 돈다.
-          npm run price-only | tee /tmp/price-inject.log
+          # npm run price-only 와 같은 명령이다. 쓰기 토큰·시크릿이 있는 이 잡에서
+          # npm 의 전후 훅(pre/post 스크립트)이 돌 여지를 두지 않으려고 node 로 직접 부른다.
+          # npm ci·검사는 verify 잡에서만 한다.
+          node dashboard/ingest.mjs --price-only | tee /tmp/price-inject.log
 
       # 캐시와 화면을 **한 번에** 본다. 캐시만 보면 "캐시는 그대로인데 화면이 밀려
       # 있던" 회차를 놓친다(위 자기 치유의 반쪽). data.json 은 gitignored 다.
@@ -119,15 +131,23 @@ jobs:
             echo "파일 $(git diff --cached --name-only | wc -l | tr -d ' ')개 변경"
             git diff --cached --name-only | sed 's/^/  /'
           fi
+          # 위 git add 로 스테이징한 뒤에 판정한다. 캐시만 바뀌고 화면·데이터가
+          # 그대로인 회차는 품질 게이트를 건너뛴다.
+          if git diff --cached --quiet -- dashboard/dashboard.html dashboard/data.js; then
+            echo "needs_verify=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_verify=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # main 은 ruleset 보호라 PR 로 들어간다 — 다른 수집 워크플로와 같은 경로.
       # 캐시와 data.js 를 **한 PR 로** 넣는다. 둘을 나누면 캐시만 병합된 채
       # data.js 주입이 빠지는 창이 생기고, 그 사이에 report.yml 이 돌면
       # verify-report 의 [가격] 캐시 대조 검사에 걸려 리포트가 실패한다.
-      - name: PR 로 반영
+      # 이 잡은 브랜치를 만들어 push 까지만 한다. PR 생성·병합은 merge 잡이 하고,
+      # 그 사이 verify 잡이 이 커밋(sha)을 읽기 권한으로 검사한다.
+      - name: 브랜치로 push
+        id: push
         if: steps.diff.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           ASOF=$(node -e "
@@ -136,6 +156,8 @@ jobs:
             process.stdout.write(JSON.parse(fs.readFileSync(dir+'/'+f,'utf8')).asOf);
           ")
           [ -n "$ASOF" ] || { echo "::error::캐시에서 기준일을 읽지 못했다"; exit 1; }
+          # 출력·커밋 메시지·PR 제목에 들어가는 값이다. 한 줄 YYYY-MM-DD 가 아니면 멈춘다.
+          [[ "$ASOF" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::기준일 형식이 YYYY-MM-DD 가 아니다"; exit 1; }
           BRANCH="price/$(date -u +%Y%m%d-%H%M%S)"
 
           git config user.name  'github-actions[bot]'
@@ -144,26 +166,21 @@ jobs:
           git commit -m "data: 가격 수집 ${ASOF} 기준" \
                      -m "한국부동산원 주간 아파트 매매가격지수. GitHub Actions 자동 수집 (실행 ${{ github.run_id }}). 캐시 + ⑥ 가격만 반영한 data.js. 거래량과 generatedAt 은 건드리지 않았다."
           git push origin "$BRANCH"
+          SHA=$(git rev-parse HEAD)
+          {
+            echo "branch=$BRANCH"
+            echo "sha=$SHA"
+            echo "asof=$ASOF"
+          } >> "$GITHUB_OUTPUT"
+          # merge 잡이 실패해도 무엇이 push 됐는지 이 실행 요약에서 찾을 수 있게 남긴다.
+          {
+            echo "### 수집 브랜치"
+            echo "- 브랜치: \`$BRANCH\`"
+            echo "- 커밋: \`$SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          gh pr create --base main --head "$BRANCH" \
-            --title "data: 가격 수집 ${ASOF} 기준" \
-            --body "$(printf '%s\n' \
-              '한국부동산원 주간 아파트 매매가격지수 캐시를 갱신하고, ⑥ 가격만 `data.js` 에 다시 넣었다. 요구 승인이 0건이라 승인 없이 병합된다.' \
-              '' \
-              '거래량(①②③·추이)과 `generatedAt` 은 그대로다 — RTMS 를 부르지 않았다.' \
-              '' \
-              '병합 뒤 `report.yml` 을 불러 06번 그림을 다시 그리고 발행까지 이어 간다.' \
-              '' \
-              "실행: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")"
-
-          gh pr merge "$BRANCH" --squash --delete-branch
-
-          # GITHUB_TOKEN 의 병합은 push 트리거를 발동시키지 않으므로 직접 부른다
-          # (ingest.yml 과 같은 경로). report.yml 이 검증·렌더·커밋을 하고 발행까지
-          # 이어 간다 — verify-report 가 실패하면 그림도 발행도 나가지 않는다.
-          gh workflow run report.yml --ref main
-          echo "리포트 생성(report.yml) 요청 완료 — 06번만 바뀐다"
-
+      # 가격 로그(/tmp/*.log)는 이 VM 에만 있으므로 수집 요약은 이 잡에서 쓴다.
+      # 품질 게이트 결과 줄은 merge 잡의 요약에 나온다.
       - name: 결과 요약
         if: always()
         run: |
@@ -175,4 +192,280 @@ jobs:
             echo ""
             echo "- 캐시 변경: **${{ steps.diff.outputs.changed || 'false' }}**"
             echo "- 바뀌는 그림: **06 (가격) 하나** — 01~05 와 거래량 숫자는 그대로"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 2. 검사 잡: 읽기 권한만. 의존성 코드(npm ci·puppeteer)는 이 잡에서만 돈다 ──
+  # verify.yml 은 수집 워크플로가 GITHUB_TOKEN 으로 연 PR 에서는 실행 승인 대기가
+  # 만료돼 돌지 않는다(실행 #43, PR #88). 그래서 병합 전에 이 잡이 직접 검사한다.
+  # 쓰기 토큰·시크릿이 있는 수집 VM 에서 의존성 코드를 돌리지 않으려고 잡을 나눴다.
+  # 단계 구성은 verify.yml 과 같다. 실패해도 병합은 막지 않는다 — 경고만 남긴다.
+  # 준비 단계(npm ci·AppArmor·크롬 확인)도 실패를 허용한다. 크롬 다운로드 같은 일시적
+  # 실패로 데이터 병합이 멈추지 않게 하기 위해서다. 준비가 실패하면 검사는
+  # 건너뛰고 "준비 실패" 경고를 남긴다.
+  verify:
+    needs: price
+    if: needs.price.outputs.changed == 'true' && needs.price.outputs.needs_verify == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+    steps:
+      # 수집 잡이 push 한 커밋을 그대로 검사한다. 토큰을 .git 설정에 남기지 않는다.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.price.outputs.sha }}
+          persist-credentials: false
+
+      # 수집 잡과 같은 '22'(22.x 최신 — puppeteer 의 node >=22.12.0 충족). npm 캐시는 쓰지 않는다.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # puppeteer 가 postinstall 에서 Chrome for Testing 을 내려받는다.
+      # 러너에 크롬이 기본 설치돼 있지 않으므로 이 단계가 곧 크롬 설치다.
+      # 다운로드가 걸려도 병합을 붙잡지 않게 단계 제한 시간을 둔다.
+      - name: 의존성 설치 (puppeteer + Chrome)
+        id: npm_ci
+        continue-on-error: true
+        timeout-minutes: 8
+        run: npm ci
+
+      # Ubuntu 23.10+ 는 AppArmor 로 비특권 user namespace 를 막아 크롬 샌드박스가 뜨지 않는다.
+      # 제품 코드에 --no-sandbox 를 넣는 대신 러너 쪽 제한을 푼다(verify.yml 과 같은 처리).
+      # 실패하면 샌드박스가 뜨지 않으므로 검사를 건너뛰고 준비 실패로 경고한다.
+      - name: 크롬 샌드박스 허용 (AppArmor 제한 해제)
+        id: apparmor
+        continue-on-error: true
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # puppeteer 25 의 executablePath() 는 Promise 를 반환한다 — await 해야 경로가 나온다.
+      # npm ci 가 실패했으면 puppeteer 가 없어 같은 원인으로 또 실패하므로 건너뛴다.
+      - name: 크롬 실제 존재 확인
+        id: chrome
+        if: steps.npm_ci.outcome == 'success'
+        continue-on-error: true
+        run: |
+          node -e "
+          const p = require('puppeteer');
+          const fs = require('node:fs');
+          (async () => {
+            const ep = await p.executablePath();
+            console.log('executablePath:', ep);
+            fs.accessSync(ep, fs.constants.X_OK);
+            console.log('실행 가능 확인 완료');
+          })().catch(e => { console.error('크롬 실행파일 확인 실패:', e.message); process.exit(1); });
+          "
+
+      # continue-on-error 단계는 실패해도 conclusion 이 success 라서 outcome 으로 본다.
+      # 준비 세 단계가 모두 성공했을 때만 돈다.
+      - name: 품질 게이트 실행
+        id: quality
+        if: steps.npm_ci.outcome == 'success' && steps.apparmor.outcome == 'success' && steps.chrome.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: npm run verify
+
+      # 검사가 건너뛰어졌다 = 준비 단계 중 하나가 성공하지 못했다(잡 조건상 검사 대상 회차다).
+      # 이 잡은 merge 잡보다 먼저 끝난다 — 그래서 문구는 "막지 않는다" 로 쓴다.
+      - name: 품질 게이트 준비 실패 경고
+        if: steps.quality.outcome == 'skipped'
+        run: |
+          FAILED=""
+          for pair in "의존성 설치 (puppeteer + Chrome)=${{ steps.npm_ci.outcome }}" \
+                      "크롬 샌드박스 허용 (AppArmor 제한 해제)=${{ steps.apparmor.outcome }}" \
+                      "크롬 실제 존재 확인=${{ steps.chrome.outcome }}"; do
+            case "${pair##*=}" in
+              failure|cancelled) FAILED="${FAILED:+$FAILED, }${pair%=*}(${pair##*=})" ;;
+            esac
+          done
+          echo "::warning title=품질 게이트 준비 실패::'$FAILED' 단계가 실패해 npm run verify 를 실행하지 못했다 — 병합은 막지 않는다(경고만)"
+          {
+            echo "### ⚠️ 품질 게이트를 실행하지 못함"
+            echo "- 실패한 준비 단계: $FAILED — 병합은 막지 않는다(경고만)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 품질 게이트 실패 경고
+        if: steps.quality.outcome == 'failure' || steps.quality.outcome == 'cancelled'
+        run: |
+          echo "::warning title=품질 게이트 실패::npm run verify 실패(${{ steps.quality.outcome }}) — 병합은 막지 않는다(경고만). '품질 게이트 실행' 단계 로그를 확인하라"
+          {
+            echo "### ⚠️ 품질 게이트 실패"
+            echo "- npm run verify 실패(${{ steps.quality.outcome }}) — 병합은 막지 않는다(경고만). '품질 게이트 실행' 단계 로그 확인"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # merge 잡이 결과 줄을 쓰도록 판정을 잡 출력으로 넘긴다: 통과 / 실패 / 준비실패.
+      - name: 판정
+        id: verdict
+        if: always()
+        run: |
+          PREP=" ${{ steps.npm_ci.outcome }} ${{ steps.apparmor.outcome }} ${{ steps.chrome.outcome }} "
+          case "${{ steps.quality.outcome }}" in
+            success) V="통과" ;;
+            failure|cancelled) V="실패" ;;
+            *) case "$PREP" in
+                 *" failure "*|*" cancelled "*) V="준비실패" ;;
+                 *) V="" ;;
+               esac ;;
+          esac
+          echo "verdict=$V" >> "$GITHUB_OUTPUT"
+          echo "판정: ${V:-(없음)}"
+
+  # ── 3. 병합 잡: PR·actions 쓰기 권한. 체크아웃도 npm 도 하지 않는다 ──
+  # 검사가 실패하거나 건너뛰어져도 돈다(!cancelled()) — 경고만 남기고 병합은 막지 않는다.
+  merge:
+    needs: [price, verify]
+    if: ${{ !cancelled() && needs.price.result == 'success' && needs.price.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      # 마지막의 `gh workflow run report.yml` 이 이 권한을 쓴다. 없으면 호출이
+      # HTTP 403 (Resource not accessible by integration) 으로 죽는다 — ingest.yml 과 같은 이유.
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ needs.price.outputs.branch }}
+      SHA: ${{ needs.price.outputs.sha }}
+      ASOF: ${{ needs.price.outputs.asof }}
+    steps:
+      # 수집 잡 출력은 아래에서 git ref·API 경로·PR 제목에 그대로 쓰인다.
+      # 수집 잡이 만드는 형식과 정확히 같지 않으면 아무것도 하지 않고 멈춘다.
+      - name: 수집 잡 출력 검사
+        run: |
+          set -euo pipefail
+          ok=true
+          [[ "$BRANCH" =~ ^price/[0-9]{8}-[0-9]{6}$ ]] || { echo "::error::branch 가 price/YYYYMMDD-HHMMSS 형식이 아니다"; ok=false; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha 가 40자 16진수가 아니다"; ok=false; }
+          [[ "$ASOF" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::asof 가 YYYY-MM-DD 형식이 아니다"; ok=false; }
+          $ok
+
+      # 아래 gh pr merge --match-head-commit 지원 여부를 로그로 남긴다.
+      - name: gh 버전
+        run: gh --version
+
+      # 재실행 대비 — 같은 head 브랜치로 열린 PR 이 이미 있으면 새로 만들지 않고 그 PR 을 쓴다.
+      - name: PR 생성
+        id: pr
+        run: |
+          set -euo pipefail
+          # main 을 향하고 같은 저장소 브랜치에서 온 열린 PR 만 재사용한다(다른 base·fork PR 은 제외).
+          PR=$(gh pr list --head "$BRANCH" --base main --state open --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')
+          if [ -n "$PR" ]; then
+            echo "열린 PR #$PR 이 이미 있다 — 그 PR 을 쓴다"
+          else
+            URL=$(gh pr create --base main --head "$BRANCH" \
+              --title "data: 가격 수집 ${ASOF} 기준" \
+              --body "$(printf '%s\n' \
+              '한국부동산원 주간 아파트 매매가격지수 캐시를 갱신하고, ⑥ 가격만 `data.js` 에 다시 넣었다. 요구 승인이 0건이라 승인 없이 병합된다.' \
+              '' \
+              '거래량(①②③·추이)과 `generatedAt` 은 그대로다 — RTMS 를 부르지 않았다.' \
+              '' \
+              '병합 뒤 `report.yml` 을 불러 06번 그림을 다시 그리고 발행까지 이어 간다.' \
+              '' \
+              "실행: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")")
+            echo "$URL"
+            PR="${URL##*/}"
+          fi
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "::error::PR 번호를 얻지 못했다"; exit 1; }
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+
+      # squash 로 합쳐 main 이력에 수집 커밋 하나만 남긴다.
+      # 수집 잡이 push 하고 verify 잡이 검사한 그 커밋일 때만 병합한다.
+      # 브랜치 삭제는 다음 단계가 따로 한다(실패해도 리포트 호출을 막지 않게).
+      - name: 병합
+        id: merge
+        env:
+          PR: ${{ steps.pr.outputs.number }}
+        # 명령 성공이 곧 병합 완료가 아닐 수 있다(병합 큐·자동 병합 대기). 실제로 MERGED 인지
+        # 확인한 뒤에만 이 단계를 성공으로 둔다 — 브랜치 정리와 리포트 요청이 이 결과를 조건으로 쓴다.
+        run: |
+          set -euo pipefail
+          gh pr merge "$PR" --squash --match-head-commit "$SHA"
+          STATE=""
+          for i in 1 2 3; do
+            STATE=$(gh pr view "$PR" --json state --jq .state)
+            [ "$STATE" = "MERGED" ] && break
+            sleep 3
+          done
+          [ "$STATE" = "MERGED" ] || { echo "::error::병합 명령은 끝났지만 PR #$PR 상태가 $STATE 다(병합 큐·자동 병합 대기 등) — 브랜치 정리와 리포트 요청을 하지 않는다"; exit 1; }
+          echo "PR #$PR 병합 확인(MERGED)"
+
+      # 예전 gh pr merge --delete-branch 와 같은 효과(병합된 원격 head 브랜치 삭제)다.
+      # 체크아웃이 없는 잡이라 gh 의 로컬 브랜치 정리에 기대지 않고 API 로 지운다.
+      # 실패해도 병합은 끝난 뒤다 — 경고만 남긴다.
+      - name: 브랜치 정리
+        id: delete_branch
+        if: steps.merge.outcome == 'success'
+        continue-on-error: true
+        run: |
+          if ! gh api -X DELETE "repos/$GH_REPO/git/refs/heads/$BRANCH"; then
+            echo "::warning title=브랜치 정리 실패::병합은 끝났다. 브랜치 $BRANCH 를 손으로 지워도 된다"
+            exit 1
+          fi
+
+      # GITHUB_TOKEN 의 병합은 push 트리거를 발동시키지 않으므로 직접 부른다
+      # (ingest.yml 과 같은 경로). report.yml 이 검증·렌더·커밋을 하고 발행까지
+      # 이어 간다 — verify-report 가 실패하면 그림도 발행도 나가지 않는다.
+      # 브랜치 정리가 실패해도 부른다 — 병합이 됐으면 06 갱신·발행까지 가야 한다.
+      - name: 리포트 요청
+        id: report
+        if: always() && steps.merge.outcome == 'success'
+        run: |
+          gh workflow run report.yml --ref main
+          echo "리포트 생성(report.yml) 요청 완료 — 06번만 바뀐다"
+
+      # 발행만 따로 복구할 수 있게 PR·병합·리포트 요청 여부를 요약에 남긴다.
+      # 품질 게이트 줄: verify 가 건너뛰어진 것은 화면·데이터가 안 바뀐 회차(needs_verify=false)
+      # 뿐이어야 정상이다. 판정이 비어 있는 그 밖의 모든 경우는 판정 누락으로 경고한다.
+      - name: 결과 (병합·품질 게이트)
+        if: always()
+        env:
+          PR: ${{ steps.pr.outputs.number }}
+          PR_STEP: ${{ steps.pr.outcome }}
+          MERGE: ${{ steps.merge.outcome }}
+          DELETE_BRANCH: ${{ steps.delete_branch.outcome }}
+          REPORT: ${{ steps.report.outcome }}
+          NEEDS_VERIFY: ${{ needs.price.outputs.needs_verify }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          VERDICT: ${{ needs.verify.outputs.verdict }}
+        run: |
+          case "$VERDICT" in
+            통과) V="통과" ;;
+            실패) V="실패(경고만, 병합은 막지 않음)" ;;
+            준비실패) V="준비 실패로 미실행(경고만, 병합은 막지 않음)" ;;
+            *) if [ "$VERIFY_RESULT" = "skipped" ] && [ "$NEEDS_VERIFY" = "false" ]; then
+                 V="건너뜀(화면·데이터 변경 없음)"
+               else
+                 V="검사 중단 또는 판정 누락(verify 잡 결과: ${VERIFY_RESULT:-없음}) — 경고만, 병합은 막지 않음"
+                 echo "::warning title=품질 게이트 판정 누락::$V"
+               fi ;;
+          esac
+          if [ -n "$PR" ]; then PR_LINE="#$PR"
+          elif [ "$PR_STEP" = "skipped" ]; then PR_LINE="건너뜀(앞 단계 실패 — 출력 검사·gh 버전 확인)"
+          else PR_LINE="만들지 못함(PR 생성·조회 실패)"; fi
+          if [ "$MERGE" = "success" ]; then MERGE_LINE="됨"; else MERGE_LINE="안 됨(${MERGE:-실행 안 함})"; fi
+          case "$DELETE_BRANCH" in
+            success) DEL_LINE="됨" ;;
+            failure) DEL_LINE="실패 — 브랜치 $BRANCH 를 손으로 지워도 된다" ;;
+            *) DEL_LINE="안 함" ;;
+          esac
+          if [ "$REPORT" = "success" ]; then
+            REPORT_LINE="됨"
+          elif [ "$MERGE" = "success" ]; then
+            REPORT_LINE="안 됨 — 발행만 복구하려면 gh workflow run report.yml --ref main"
+          else
+            REPORT_LINE="안 함(병합 안 됨)"
+          fi
+          echo "품질 게이트: $V"
+          {
+            echo "### 병합"
+            echo "- PR: $PR_LINE"
+            echo "- 병합: $MERGE_LINE"
+            echo "- 브랜치 정리: $DEL_LINE"
+            echo "- 리포트 요청(report.yml): $REPORT_LINE"
+            echo "- 품질 게이트: $V"
           } >> "$GITHUB_STEP_SUMMARY"
