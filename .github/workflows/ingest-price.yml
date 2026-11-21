@@ -352,7 +352,8 @@ jobs:
         id: pr
         run: |
           set -euo pipefail
-          PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          # main 을 향하고 같은 저장소 브랜치에서 온 열린 PR 만 재사용한다(다른 base·fork PR 은 제외).
+          PR=$(gh pr list --head "$BRANCH" --base main --state open --json number,isCrossRepository                  --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')
           if [ -n "$PR" ]; then
             echo "열린 PR #$PR 이 이미 있다 — 그 PR 을 쓴다"
           else
@@ -379,7 +380,19 @@ jobs:
         id: merge
         env:
           PR: ${{ steps.pr.outputs.number }}
-        run: gh pr merge "$PR" --squash --match-head-commit "$SHA"
+        # 명령 성공이 곧 병합 완료가 아닐 수 있다(병합 큐·자동 병합 대기). 실제로 MERGED 인지
+        # 확인한 뒤에만 이 단계를 성공으로 둔다 — 브랜치 정리와 리포트 요청이 이 결과를 조건으로 쓴다.
+        run: |
+          set -euo pipefail
+          gh pr merge "$PR" --squash --match-head-commit "$SHA"
+          STATE=""
+          for i in 1 2 3; do
+            STATE=$(gh pr view "$PR" --json state --jq .state)
+            [ "$STATE" = "MERGED" ] && break
+            sleep 3
+          done
+          [ "$STATE" = "MERGED" ] || { echo "::error::병합 명령은 끝났지만 PR #$PR 상태가 $STATE 다(병합 큐·자동 병합 대기 등) — 브랜치 정리와 리포트 요청을 하지 않는다"; exit 1; }
+          echo "PR #$PR 병합 확인(MERGED)"
 
       # 예전 gh pr merge --delete-branch 와 같은 효과(병합된 원격 head 브랜치 삭제)다.
       # 체크아웃이 없는 잡이라 gh 의 로컬 브랜치 정리에 기대지 않고 API 로 지운다.
@@ -412,6 +425,7 @@ jobs:
         if: always()
         env:
           PR: ${{ steps.pr.outputs.number }}
+          PR_STEP: ${{ steps.pr.outcome }}
           MERGE: ${{ steps.merge.outcome }}
           DELETE_BRANCH: ${{ steps.delete_branch.outcome }}
           REPORT: ${{ steps.report.outcome }}
@@ -430,7 +444,9 @@ jobs:
                  echo "::warning title=품질 게이트 판정 누락::$V"
                fi ;;
           esac
-          if [ -n "$PR" ]; then PR_LINE="#$PR"; else PR_LINE="만들지 못함"; fi
+          if [ -n "$PR" ]; then PR_LINE="#$PR"
+          elif [ "$PR_STEP" = "skipped" ]; then PR_LINE="건너뜀(앞 단계 실패 — 출력 검사·gh 버전 확인)"
+          else PR_LINE="만들지 못함(PR 생성·조회 실패)"; fi
           if [ "$MERGE" = "success" ]; then MERGE_LINE="됨"; else MERGE_LINE="안 됨(${MERGE:-실행 안 함})"; fi
           case "$DELETE_BRANCH" in
             success) DEL_LINE="됨" ;;
