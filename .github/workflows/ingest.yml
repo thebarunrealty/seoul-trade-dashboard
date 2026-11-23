@@ -23,7 +23,9 @@ on:
     # 요일 번호는 0=일요일 (GitHub 문서 기준). 즉 '일요일 22:00 UTC'.
     # 예약 실행은 부하가 몰리면 수 시간 밀릴 수 있다 — freshness.yml 의
     # MAX_AGE_DAYS 가 그 지연을 오경보로 만들지 않게 잡혀 있다.
-    - cron: '0 22 * * 0'
+    - cron: '17 0 * * 1'    # 월 09:17 KST
+    - cron: '47 1 * * 1'    # 월 10:47 KST
+    - cron: '17 3 * * 1'    # 월 12:17 KST
   workflow_dispatch:
     inputs:
       fresh:
